@@ -497,112 +497,7 @@ class PreprocessingInterface:
             self.siril.log(f"Ha dimensions: {ha_width}x{ha_height}", LogColor.BLUE)
             self.siril.log(f"OIII dimensions: {oiii_width}x{oiii_height}", LogColor.BLUE)
             
-            # Get statistics for each channel to diagnose balance issues
-            self.siril.cmd("load", ha_image)
-            ha_img = self.siril.get_image()
-            ha_stats = ha_img.stats
-            
-            # Handle different stats structure - could be list or object
-            try:
-                if isinstance(ha_stats, list) and len(ha_stats) > 0:
-                    # If it's a list, use the first element (for single channel)
-                    ha_mean = ha_stats[0].mean if hasattr(ha_stats[0], 'mean') else float(ha_stats[0])
-                    ha_median = ha_stats[0].median if hasattr(ha_stats[0], 'median') else float(ha_stats[0])
-                    ha_max = ha_stats[0].maximum if hasattr(ha_stats[0], 'maximum') else float(ha_stats[0])
-                else:
-                    # If it's an object with attributes
-                    ha_mean = ha_stats.mean
-                    ha_median = ha_stats.median
-                    ha_max = ha_stats.maximum
-            except:
-                # Fallback: use numpy on pixel data directly
-                ha_data = ha_img.data
-                ha_mean = float(np.mean(ha_data))
-                ha_median = float(np.median(ha_data))
-                ha_max = float(np.max(ha_data))
-            
-            self.siril.log(f"Ha channel stats - Mean: {ha_mean:.3f}, Median: {ha_median:.3f}, Max: {ha_max:.3f}", LogColor.BLUE)
-            
-            self.siril.cmd("load", oiii_image) 
-            oiii_img = self.siril.get_image()
-            oiii_stats = oiii_img.stats
-            
-            # Handle different stats structure for OIII
-            try:
-                if isinstance(oiii_stats, list) and len(oiii_stats) > 0:
-                    oiii_mean = oiii_stats[0].mean if hasattr(oiii_stats[0], 'mean') else float(oiii_stats[0])
-                    oiii_median = oiii_stats[0].median if hasattr(oiii_stats[0], 'median') else float(oiii_stats[0])
-                    oiii_max = oiii_stats[0].maximum if hasattr(oiii_stats[0], 'maximum') else float(oiii_stats[0])
-                else:
-                    oiii_mean = oiii_stats.mean
-                    oiii_median = oiii_stats.median
-                    oiii_max = oiii_stats.maximum
-            except:
-                # Fallback: use numpy on pixel data directly
-                oiii_data = oiii_img.data
-                oiii_mean = float(np.mean(oiii_data))
-                oiii_median = float(np.median(oiii_data))
-                oiii_max = float(np.max(oiii_data))
-            
-            self.siril.log(f"OIII channel stats - Mean: {oiii_mean:.3f}, Median: {oiii_median:.3f}, Max: {oiii_max:.3f}", LogColor.BLUE)
-            
-            # Additional debugging - check actual pixel data directly
-            ha_data = ha_img.data
-            oiii_data = oiii_img.data
-            ha_direct_mean = float(np.mean(ha_data))
-            oiii_direct_mean = float(np.mean(oiii_data))
-            ha_nonzero_mean = float(np.mean(ha_data[ha_data > 0])) if np.any(ha_data > 0) else 0.0
-            oiii_nonzero_mean = float(np.mean(oiii_data[oiii_data > 0])) if np.any(oiii_data > 0) else 0.0
-            
-            self.siril.log(f"Direct pixel analysis - Ha mean: {ha_direct_mean:.6f}, OIII mean: {oiii_direct_mean:.6f}", LogColor.BLUE)
-            self.siril.log(f"Non-zero pixels - Ha mean: {ha_nonzero_mean:.6f}, OIII mean: {oiii_nonzero_mean:.6f}", LogColor.BLUE)
-            
-            # Auto-balance channels using direct pixel analysis
-            # Use non-zero means for better comparison since many pixels might be black background
-            ha_signal = ha_nonzero_mean if ha_nonzero_mean > 0 else ha_direct_mean
-            oiii_signal = oiii_nonzero_mean if oiii_nonzero_mean > 0 else oiii_direct_mean
-            
-            balance_threshold = 1.5  # Lower threshold for normalized data
-            ha_adjusted = ha_image
-            oiii_adjusted = oiii_image
-            
-            if ha_signal > 0 and oiii_signal > 0:  # Avoid division by zero
-                ha_to_oiii_ratio = oiii_signal / ha_signal
-                
-                self.siril.log(f"Signal ratio analysis - OIII/Ha = {ha_to_oiii_ratio:.3f}", LogColor.BLUE)
-                
-                if ha_to_oiii_ratio > balance_threshold:
-                    # Ha is dimmer - boost it
-                    boost_factor = min(ha_to_oiii_ratio * 0.8, 10.0)  # Higher cap for weak signals
-                    self.siril.log(f"Ha channel is {ha_to_oiii_ratio:.2f}x dimmer than OIII, boosting by {boost_factor:.2f}x", LogColor.BLUE)
-                    
-                    self.siril.cmd("load", ha_image)
-                    self.siril.cmd("mult", boost_factor)
-                    ha_adjusted = f"{ha_image}_balanced"
-                    self.siril.cmd("save", ha_adjusted)
-                    
-                elif ha_to_oiii_ratio < (1.0 / balance_threshold):
-                    # OIII is dimmer - boost it  
-                    boost_factor = min((1.0 / ha_to_oiii_ratio) * 0.8, 10.0)  # Higher cap for weak signals
-                    self.siril.log(f"OIII channel is {1.0/ha_to_oiii_ratio:.2f}x dimmer than Ha, boosting by {boost_factor:.2f}x", LogColor.BLUE)
-                    
-                    self.siril.cmd("load", oiii_image)
-                    self.siril.cmd("mult", boost_factor)
-                    oiii_adjusted = f"{oiii_image}_balanced"
-                    self.siril.cmd("save", oiii_adjusted)
-                else:
-                    self.siril.log("Channel balance looks reasonable - no adjustment needed", LogColor.GREEN)
-            else:
-                # If we can't measure signal properly, apply a moderate Ha boost as HOO often needs it
-                self.siril.log("Unable to measure signal levels accurately - applying moderate Ha boost for HOO palette", LogColor.BLUE)
-                self.siril.cmd("load", ha_image)
-                self.siril.cmd("mult", 3.0)  # Moderate boost for typical HOO
-                ha_adjusted = f"{ha_image}_balanced"
-                self.siril.cmd("save", ha_adjusted)
-            
-            # Use the balanced images for further processing
-            ha_image = ha_adjusted
-            oiii_image = oiii_adjusted
+            self.siril.log("Using automatic linear matching for channel balancing", LogColor.BLUE)
             
             # If dimensions don't match, resize to common dimensions
             if ha_width != oiii_width or ha_height != oiii_height:
@@ -638,13 +533,32 @@ class PreprocessingInterface:
                     oiii_image = oiii_image_cropped
                     self.siril.log(f"Cropped OIII image to {target_width}x{target_height}", LogColor.BLUE)
             
-            # Now combine with matching dimensions
-            # HOO palette: Ha=Red, OIII=Green, OIII=Blue
-            # This creates a palette similar to Hubble's SHO but using available narrowband channels
-            self.siril.log("Creating HOO composition: Ha→Red, OIII→Green+Blue", LogColor.BLUE)
-            self.siril.cmd("rgbcomp", ha_image, oiii_image, oiii_image, "-out=" + output_name)
+            # Apply linear matching BEFORE composition - match OIII to Ha reference
+            self.siril.log("Applying linear matching to balance OIII channel to Ha reference", LogColor.BLUE)
+            
+            matched_oiii = oiii_image
+            try:
+                # Step 1: Load the image that needs to be matched (OIII)
+                self.siril.cmd("load", oiii_image)
+                
+                # Step 2: Apply linear match using Ha as reference 
+                # Using the same thresholds as the GUI button: low=1e-7, high=0.875
+                self.siril.cmd("linear_match", ha_image, "1e-7", "0.875")
+                
+                # Step 3: Save the matched OIII image
+                matched_oiii = f"matched_{oiii_image}"
+                self.siril.cmd("save", matched_oiii)
+                
+                self.siril.log("Successfully matched OIII channel to Ha reference", LogColor.GREEN)
+                
+            except (s.DataError, s.CommandError, s.SirilError) as e:
+                self.siril.log(f"Linear matching failed: {e}", LogColor.SALMON)
+                self.siril.log("Using original OIII image for composition", LogColor.BLUE)
+            
+            # Step 4: Now compose using the original Ha and the matched OIII
+            self.siril.log("Creating HOO composition with linear matched channels", LogColor.BLUE)
+            self.siril.cmd("rgbcomp", ha_image, matched_oiii, matched_oiii, "-out=" + output_name)
             self.siril.log(f"Successfully created HOO composition: {output_name}", LogColor.GREEN)
-            self.siril.log("Note: Very blue results may indicate weak Ha signal - consider manual channel balancing", LogColor.BLUE)
             return output_name
             
         except (s.DataError, s.CommandError, s.SirilError) as e:
@@ -1013,10 +927,9 @@ class PreprocessingInterface:
             "6. Ha/OIII extraction automatically applies 2x additional drizzle to Ha channel for resolution recovery.\n"
             "7. If Ha/OIII is enabled, drizzle is automatically enabled with minimum 1.0x factor.\n"
             "8. Ha/OIII extraction keeps all frames as CFA (no debayering) to preserve channel data.\n"
-            "9. HOO palette maps Ha→Red, OIII→Green+Blue. Very blue results indicate weak Ha signal.\n"
-            "10. Script automatically balances channels if one is 3x dimmer than the other.\n"
-            "11. Drizzle increases processing time. Higher the drizzle the longer it takes.\n"
-            "12. When asking for help, please have the logs handy."
+            "9. HOO palette maps Ha→Red, OIII→Green+Blue with automatic linear matching before composition.\n"
+            "10. Drizzle increases processing time. Higher the drizzle the longer it takes.\n"
+            "11. When asking for help, please have the logs handy."
         )
         self.siril.info_messagebox(help_text, True)
         self.siril.log(help_text, LogColor.BLUE)
