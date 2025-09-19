@@ -1066,15 +1066,31 @@ class PreprocessingInterface:
         )
 
         haoiii_checkbox_variable = tk.BooleanVar()
+        
+        def toggle_hoo_spcc_exclusivity():
+            """Make HOO and SPCC mutually exclusive."""
+            if haoiii_checkbox_variable.get():
+                # HOO enabled - disable SPCC
+                self.spcc_checkbox_variable.set(False)
+                spcc_checkbox["state"] = tk.DISABLED
+                self.filter_menu["state"] = tk.DISABLED
+                catalog_menu["state"] = tk.DISABLED
+            else:
+                # HOO disabled - re-enable SPCC
+                spcc_checkbox["state"] = tk.NORMAL
+        
         haoiii_checkbox = ttk.Checkbutton(
-            calib_section, text="Extract Ha/OIII", variable=haoiii_checkbox_variable
+            calib_section, text="Extract Ha/OIII", 
+            variable=haoiii_checkbox_variable,
+            command=toggle_hoo_spcc_exclusivity
         )
         haoiii_checkbox.grid(row=3, column=1, sticky="w")
         tksiril.create_tooltip(
             haoiii_checkbox,
             "Extract Ha/OIII channels from dual-band filter images.\n"
             "Creates HOO palette similar to Hubble SHO.\n"
-            "Useful for narrowband imaging with OSC cameras.",
+            "Useful for narrowband imaging with OSC cameras.\n"
+            "Note: HOO and SPCC are mutually exclusive options.",
         )
 
         ttk.Label(calib_section, text="Registration:", style="Bold.TLabel").grid(
@@ -1169,16 +1185,32 @@ class PreprocessingInterface:
         self.spcc_checkbox_variable = tk.BooleanVar()
 
         def toggle_filter_and_gaia():
-            state = tk.NORMAL if self.spcc_checkbox_variable.get() else tk.DISABLED
-            self.filter_menu["state"] = state
-            catalog_menu["state"] = state
+            """Toggle SPCC options and handle mutual exclusivity with HOO."""
+            if self.spcc_checkbox_variable.get():
+                # SPCC enabled - disable HOO and enable SPCC options
+                haoiii_checkbox_variable.set(False)
+                haoiii_checkbox["state"] = tk.DISABLED
+                self.filter_menu["state"] = tk.NORMAL
+                catalog_menu["state"] = tk.NORMAL
+            else:
+                # SPCC disabled - re-enable HOO and disable SPCC options
+                haoiii_checkbox["state"] = tk.NORMAL
+                self.filter_menu["state"] = tk.DISABLED
+                catalog_menu["state"] = tk.DISABLED
 
-        ttk.Checkbutton(
+        spcc_checkbox = ttk.Checkbutton(
             self.spcc_section,
             text="Enable Spectrophotometric Color Calibration (SPCC)",
             variable=self.spcc_checkbox_variable,
             command=toggle_filter_and_gaia,
-        ).grid(row=1, column=0, columnspan=2, sticky="w")
+        )
+        spcc_checkbox.grid(row=1, column=0, columnspan=2, sticky="w")
+        tksiril.create_tooltip(
+            spcc_checkbox,
+            "Apply spectrophotometric color calibration for accurate broadband colors.\n"
+            "Best for natural color imaging with broadband filters.\n"
+            "Note: SPCC and Ha/OIII processing are mutually exclusive options.",
+        )
 
         ttk.Label(self.spcc_section, text="OSC Filter:", style="Bold.TLabel").grid(
             row=2, column=0, sticky="w"
@@ -1802,27 +1834,23 @@ class PreprocessingInterface:
             # Save og image in WD - might have drizzle factor in name
             file_name = self.save_image("_batched")
 
-        # Spcc as a last step
+        # SPCC as a last step (mutual exclusivity prevents both HOO and SPCC being enabled)
         if do_spcc:
-            # For Ha/OIII workflow, SPCC may not be as applicable since it's already a processed composite
-            if ha_oiii_extract:
-                self.siril.log("SPCC is typically not applied to HOO composite images", LogColor.SALMON)
-            else:
-                img = self.spcc(
-                    oscsensor=telescope,
-                    filter=filter,
-                    catalog=catalog,
-                    whiteref="Average Spiral Galaxy",
-                )
+            img = self.spcc(
+                oscsensor=telescope,
+                filter=filter,
+                catalog=catalog,
+                whiteref="Average Spiral Galaxy",
+            )
 
-                # self.autostretch(do_spcc=do_spcc)
-                if drizzle:
-                    img = os.path.basename(img) + self.fits_extension
-                else:
-                    img = os.path.basename(img)
-                self.load_image(
-                    image_name=os.path.basename(img)
-                )  # Load either og or spcc image
+            # self.autostretch(do_spcc=do_spcc)
+            if drizzle:
+                img = os.path.basename(img) + self.fits_extension
+            else:
+                img = os.path.basename(img)
+            self.load_image(
+                image_name=os.path.basename(img)
+            )  # Load either og or spcc image
 
         # self.clean_up()
         import datetime
