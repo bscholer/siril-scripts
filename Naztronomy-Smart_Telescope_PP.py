@@ -113,6 +113,40 @@ UI_DEFAULTS = {
     "max_files_per_batch": 2000,
 }
 
+# Palette configuration - centralized for UI and processing
+# Ideas from https://www.cloudynights.com/topic/800240-differences-of-bi-color-pallets-ha-oiii/
+PALETTE_CONFIG = {
+    "HOO": {
+        "description": "Ha→Red, OIII→Green+Blue (traditional)",
+        "channels": {"R": "ha", "G": "oiii", "B": "oiii"}
+    },
+    "OHH": {
+        "description": "OIII→Red, Ha→Green+Blue (inverted)",
+        "channels": {"R": "oiii", "G": "ha", "B": "ha"}
+    },
+    "HHO": {
+        "description": "Ha→Red+Green, OIII→Blue (SHO-like)",
+        "channels": {"R": "ha", "G": "ha", "B": "oiii"}
+    },
+    "OOH": {
+        "description": "OIII→Red+Green, Ha→Blue (electric blue)",
+        "channels": {"R": "oiii", "G": "oiii", "B": "ha"}
+    },
+    "HOH": {
+        "description": "Ha→Red+Blue, OIII→Green (purple nebulae)",
+        "channels": {"R": "ha", "G": "oiii", "B": "ha"}
+    },
+    "OHO": {
+        "description": "OIII→Red+Blue, Ha→Green (greenish)",
+        "channels": {"R": "oiii", "G": "ha", "B": "oiii"}
+    },
+    "HSO": {
+        "description": "Ha→Red, Synthetic Green, OIII→Blue (Hubble-style)",
+        "channels": {"R": "ha", "G": "synthetic", "B": "oiii"},
+        "requires_synthetic": True
+    }
+}
+
 
 class MacOSFriendlyDialog:
     def __init__(self, parent):
@@ -520,20 +554,68 @@ class PreprocessingInterface:
             self.siril.log(f"OIII normalization failed: {e}", LogColor.RED)
             return oiii_result  # Return original if normalization fails
     
-    def create_final_hoo_composition(self, ha_result, normalized_oiii_result):
-        """Create final HOO composition using normalized channels."""
+    def create_synthetic_green_channel(self, ha_result, oiii_result, output_name="synthetic_green"):
+        """Create synthetic green channel for HSO palette: G = (Ha * 0.7) + (OIII * 0.3)"""
         try:
-            self.siril.log("Creating final HOO composition", LogColor.BLUE)
+            self.siril.log("Creating synthetic green channel for HSO palette", LogColor.BLUE)
             
-            # HOO palette: Ha -> Red, OIII -> Green and Blue
-            output_name = "HOO_final_result"
-            self.siril.cmd("rgbcomp", ha_result, normalized_oiii_result, normalized_oiii_result, f"-out={output_name}")
+            # Use PixelMath to create synthetic green: (Ha * 0.7) + (OIII * 0.3)
+            synthetic_formula = f"(${ha_result}$ * 0.7) + (${oiii_result}$ * 0.3)"
+            self.siril.log(f"Synthetic green formula: {synthetic_formula}", LogColor.BLUE)
             
-            self.siril.log(f"Successfully created HOO composition: {output_name}", LogColor.GREEN)
+            self.siril.cmd("pm", synthetic_formula)
+            self.siril.cmd("save", output_name)
+            
+            self.siril.log("Successfully created synthetic green channel", LogColor.GREEN)
             return output_name
             
         except (s.DataError, s.CommandError, s.SirilError) as e:
-            self.siril.log(f"Final HOO composition failed: {e}", LogColor.RED)
+            self.siril.log(f"Synthetic green creation failed: {e}", LogColor.RED)
+            return None
+
+    def create_final_hoo_composition(self, ha_result, normalized_oiii_result, palette="HOO"):
+        """Create final composition using selected artistic palette with dictionary-based configuration."""
+        
+        try:
+            self.siril.log(f"Creating final composition with {palette} palette", LogColor.BLUE)
+            
+            # Get palette configuration
+            config = PALETTE_CONFIG.get(palette)
+            if not config:
+                self.siril.log(f"Unknown palette {palette}, using default HOO", LogColor.SALMON)
+                config = PALETTE_CONFIG["HOO"]
+                palette = "HOO"
+            
+            self.siril.log(f"Using {palette} palette: {config['description']}", LogColor.BLUE)
+            
+            # Prepare channel data
+            channels = {"ha": ha_result, "oiii": normalized_oiii_result}
+            
+            # Handle synthetic green channel for HSO
+            if config.get("requires_synthetic", False):
+                synthetic_green = self.create_synthetic_green_channel(ha_result, normalized_oiii_result)
+                if synthetic_green is None:
+                    self.siril.log("Failed to create synthetic green, falling back to HOO", LogColor.SALMON)
+                    config = PALETTE_CONFIG["HOO"]
+                    palette = "HOO"
+                else:
+                    channels["synthetic"] = synthetic_green
+            
+            # Build RGB composition command using configuration
+            red_channel = channels[config["channels"]["R"]]
+            green_channel = channels[config["channels"]["G"]]
+            blue_channel = channels[config["channels"]["B"]]
+            
+            output_name = f"{palette}_final_result"
+            
+            self.siril.log(f"RGB mapping: R={config['channels']['R']}, G={config['channels']['G']}, B={config['channels']['B']}", LogColor.BLUE)
+            self.siril.cmd("rgbcomp", red_channel, green_channel, blue_channel, f"-out={output_name}")
+            
+            self.siril.log(f"Successfully created {palette} composition: {output_name}", LogColor.GREEN)
+            return output_name
+            
+        except (s.DataError, s.CommandError, s.SirilError) as e:
+            self.siril.log(f"Final {palette} composition failed: {e}", LogColor.RED)
             return None
 
     def is_black_frame(self, data, threshold=10, crop_fraction=0.4):
@@ -962,7 +1044,7 @@ class PreprocessingInterface:
             "6. Ha/OIII extraction uses built-in script pattern with -resample=ha for proper upscaling.\n"
             "7. Ha/OIII workflow creates master calibration frames in masters/ directory.\n"
             "8. Ha/OIII extraction keeps all frames as CFA (no debayering) to preserve channel data.\n"
-            "9. HOO palette uses PixelMath normalization and result alignment for best quality.\n"
+            "9. Multiple artistic palettes available: HOO, OHH, HHO, OOH, HOH, OHO, HSO with synthetic green.\n"
             "10. Drizzle increases processing time. Higher the drizzle the longer it takes.\n"
             "11. When asking for help, please have the logs handy."
         )
@@ -1066,18 +1148,37 @@ class PreprocessingInterface:
         )
 
         haoiii_checkbox_variable = tk.BooleanVar()
+
+        # Add palette selection dropdown first (using centralized config)
+        ttk.Label(calib_section, text="Palette:", style="Bold.TLabel").grid(
+            row=3, column=2, sticky="w", padx=(10,5)
+        )
+        
+        # Generate palette options from configuration dictionary
+        palette_options = list(PALETTE_CONFIG.keys())
+        palette_variable = tk.StringVar(value="HOO")
+        palette_dropdown = ttk.OptionMenu(
+            calib_section,
+            palette_variable, 
+            "HOO",
+            *palette_options
+        )
+        palette_dropdown.grid(row=3, column=3, sticky="w")
+        palette_dropdown["state"] = tk.DISABLED  # Initially disabled
         
         def toggle_hoo_spcc_exclusivity():
-            """Make HOO and SPCC mutually exclusive."""
+            """Make HOO and SPCC mutually exclusive and control palette dropdown."""
             if haoiii_checkbox_variable.get():
-                # HOO enabled - disable SPCC
+                # HOO enabled - disable SPCC, enable palette dropdown
                 self.spcc_checkbox_variable.set(False)
                 spcc_checkbox["state"] = tk.DISABLED
                 self.filter_menu["state"] = tk.DISABLED
                 catalog_menu["state"] = tk.DISABLED
+                palette_dropdown["state"] = tk.NORMAL
             else:
-                # HOO disabled - re-enable SPCC
+                # HOO disabled - re-enable SPCC, disable palette dropdown
                 spcc_checkbox["state"] = tk.NORMAL
+                palette_dropdown["state"] = tk.DISABLED
         
         haoiii_checkbox = ttk.Checkbutton(
             calib_section, text="Extract Ha/OIII", 
@@ -1088,10 +1189,17 @@ class PreprocessingInterface:
         tksiril.create_tooltip(
             haoiii_checkbox,
             "Extract Ha/OIII channels from dual-band filter images.\n"
-            "Creates HOO palette similar to Hubble SHO.\n"
+            "Creates artistic narrowband palettes with multiple color options.\n"
             "Useful for narrowband imaging with OSC cameras.\n"
             "Note: HOO and SPCC are mutually exclusive options.",
         )
+        
+        # Generate tooltip dynamically from palette configuration
+        palette_tooltip = "Choose artistic color palette for Ha/OIII composition:\n\n"
+        for palette_name, config in PALETTE_CONFIG.items():
+            palette_tooltip += f"{palette_name}: {config['description']}\n"
+        
+        tksiril.create_tooltip(palette_dropdown, palette_tooltip.strip())
 
         ttk.Label(calib_section, text="Registration:", style="Bold.TLabel").grid(
             row=4, column=0, sticky="w"
@@ -1190,6 +1298,7 @@ class PreprocessingInterface:
                 # SPCC enabled - disable HOO and enable SPCC options
                 haoiii_checkbox_variable.set(False)
                 haoiii_checkbox["state"] = tk.DISABLED
+                palette_dropdown["state"] = tk.DISABLED
                 self.filter_menu["state"] = tk.NORMAL
                 catalog_menu["state"] = tk.NORMAL
             else:
@@ -1268,6 +1377,7 @@ class PreprocessingInterface:
                 use_biases=biases_checkbox_variable.get(),
                 bg_extract=bg_extract_checkbox_variable.get(),
                 ha_oiii_extract=haoiii_checkbox_variable.get(),
+                palette=palette_variable.get(),
                 drizzle=drizzle_checkbox_variable.get(),
                 drizzle_amount=float(drizzle_amount_spinbox.get()),
                 pixel_fraction=float(pixel_fraction_spinbox.get()),
@@ -1423,6 +1533,7 @@ class PreprocessingInterface:
         use_flats: bool = False,
         use_biases: bool = False,
         bg_extract: bool = False,
+        palette: str = "HOO",
         drizzle: bool = False,
         drizzle_amount: float = UI_DEFAULTS["drizzle_amount"],
         pixel_fraction: float = UI_DEFAULTS["pixel_fraction"],
@@ -1540,8 +1651,8 @@ class PreprocessingInterface:
             except Exception as e:
                 self.siril.log(f"Could not save Ha with LIVETIME: {e}", LogColor.SALMON)
             
-            # Phase 10: Create final HOO composition
-            hoo_result = self.create_final_hoo_composition(aligned_ha, normalized_oiii)
+            # Phase 10: Create final composition with selected palette
+            hoo_result = self.create_final_hoo_composition(aligned_ha, normalized_oiii, palette)
             
             if hoo_result is None:
                 self.siril.log("HOO composition failed", LogColor.RED)
@@ -1553,8 +1664,8 @@ class PreprocessingInterface:
             # Go back to working directory
             self.siril.cmd("cd", "../")
             
-            # Save the final result
-            final_file_name = self.save_image("_HOO")
+            # Save the final result with palette name
+            final_file_name = self.save_image(f"_{palette}")
             self.siril.log(f"Ha/OIII workflow completed successfully: {final_file_name}", LogColor.GREEN)
             
             return final_file_name
@@ -1627,6 +1738,7 @@ class PreprocessingInterface:
         use_biases: bool = False,
         bg_extract: bool = False,
         ha_oiii_extract: bool = False,
+        palette: str = "HOO",
         drizzle: bool = False,
         drizzle_amount: float = UI_DEFAULTS["drizzle_amount"],
         pixel_fraction: float = UI_DEFAULTS["pixel_fraction"],
@@ -1645,6 +1757,7 @@ class PreprocessingInterface:
             f"use_biases={use_biases}\n"
             f"bg_extract={bg_extract}\n"
             f"ha_oiii_extract={ha_oiii_extract}\n"
+            f"palette={palette}\n"
             f"drizzle={drizzle}\n"
             f"drizzle_amount={drizzle_amount}\n"
             f"pixel_fraction={pixel_fraction}\n"
@@ -1695,12 +1808,13 @@ class PreprocessingInterface:
 
         # Check if Ha/OIII extraction is enabled
         if ha_oiii_extract:
-            self.siril.log("Ha/OIII extraction enabled - using narrowband workflow", LogColor.BLUE)
+            self.siril.log(f"Ha/OIII extraction enabled - using narrowband workflow with {palette} palette", LogColor.BLUE)
             file_name = self.process_ha_oiii_workflow(
                 use_darks=use_darks,
                 use_flats=use_flats,
                 use_biases=use_biases,
                 bg_extract=bg_extract,
+                palette=palette,
                 drizzle=drizzle,
                 drizzle_amount=drizzle_amount,
                 pixel_fraction=pixel_fraction,
