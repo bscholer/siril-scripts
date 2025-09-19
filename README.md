@@ -4,7 +4,7 @@
 
 ### Naztronomy-Smart_Telescope_PP.py
 
-A Python script that automates the preprocessing workflow, including file conversion, registration, stacking, and SPCC color calibration.
+A Python script that automates the preprocessing workflow, including file conversion, registration, stacking, and SPCC color calibration, or dual-band conversion to various Ha/OIII color palettes.
 
 ### Naztronomy-Seestar_Broadband_Mosaic.ssf
 
