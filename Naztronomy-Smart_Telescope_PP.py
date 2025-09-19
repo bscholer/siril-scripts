@@ -309,7 +309,7 @@ class PreprocessingInterface:
         self.create_widgets()
 
     # Dirname: lights, darks, biases, flats
-    def convert_files(self, dir_name):
+    def convert_files(self, dir_name, ha_oiii_mode=False):
         directory = os.path.join(self.current_working_directory, dir_name)
         if os.path.isdir(directory):
             self.siril.cmd("cd", dir_name)
@@ -323,13 +323,21 @@ class PreprocessingInterface:
 
             try:
                 args = ["convert", dir_name, "-out=../process"]
-                if "lights" in dir_name.lower():
-                    if not self.drizzle_status:
-                        args.append("-debayer")
+                
+                # Special handling for Ha/OIII extraction
+                if ha_oiii_mode:
+                    # For Ha/OIII extraction, lights must stay as CFA (no debayering)
+                    # Calibration frames should also not be debayered to match
+                    self.siril.log(f"Ha/OIII mode: converting {dir_name} without debayering", LogColor.BLUE)
                 else:
-                    if not self.drizzle_status:
-                        # flats, darks, bias: only debayer if drizzle is not set
-                        args.append("-debayer")
+                    # Regular workflow debayering logic
+                    if "lights" in dir_name.lower():
+                        if not self.drizzle_status:
+                            args.append("-debayer")
+                    else:
+                        if not self.drizzle_status:
+                            # flats, darks, bias: only debayer if drizzle is not set
+                            args.append("-debayer")
 
                 self.siril.log(" ".join(str(arg) for arg in args), LogColor.GREEN)
                 self.siril.cmd(*args)
@@ -413,6 +421,121 @@ class PreprocessingInterface:
 
         self.siril.log("Registered Sequence", LogColor.GREEN)
 
+    def extract_ha_oiii(self, seq_name):
+        """Extract Ha and OIII channels from CFA sequence using seqextract_HaOIII with Ha resampling."""
+        try:
+            self.siril.log(f"Extracting Ha and OIII from sequence: {seq_name} with Ha resampling", LogColor.BLUE)
+            # Key fix: Add -resample=ha to upscale Ha channel properly
+            self.siril.cmd("seqextract_HaOIII", seq_name, "-resample=ha")
+            self.siril.log("Successfully extracted Ha and OIII channels with Ha resampling", LogColor.GREEN)
+            return f"Ha_{seq_name}", f"OIII_{seq_name}"
+        except (s.DataError, s.CommandError, s.SirilError) as e:
+            self.siril.log(f"Ha/OIII extraction failed: {e}", LogColor.RED)
+            self.close_dialog()
+            return None, None
+
+    def process_single_channel(self, seq_name, output_suffix):
+        """Process a single narrowband channel (Ha or OIII) following built-in script pattern."""
+        try:
+            self.siril.log(f"Processing {seq_name} channel", LogColor.BLUE)
+            
+            # Align lights (equivalent to register in built-in script)
+            self.siril.cmd("register", seq_name)
+            
+            # Stack calibrated lights to temporary result  
+            registered_seq_name = f"r_{seq_name}"
+            temp_result = f"results_{output_suffix}"
+            
+            # Check for black frames if drizzle is enabled
+            if self.drizzle_status:
+                self.scan_black_frames(seq_name=registered_seq_name)
+            
+            # Stack with built-in script parameters
+            cmd_args = [
+                "stack", 
+                f"{registered_seq_name} rej 3 3",
+                "-norm=addscale", 
+                "-output_norm", 
+                "-32b", 
+                f"-out={temp_result}"
+            ]
+            
+            self.siril.log(f"Stacking {seq_name} with built-in script parameters", LogColor.BLUE)
+            self.siril.cmd(*cmd_args)
+            
+            # Mirror if required (from built-in script)
+            try:
+                self.siril.cmd("mirrorx_single", temp_result)
+                self.siril.log(f"Applied mirror correction to {temp_result}", LogColor.BLUE)
+            except (s.DataError, s.CommandError, s.SirilError):
+                # Mirror correction is optional
+                pass
+            
+            return temp_result
+            
+        except (s.DataError, s.CommandError, s.SirilError) as e:
+            self.siril.log(f"Single channel processing failed for {seq_name}: {e}", LogColor.RED)
+            return None
+
+    def align_results(self, ha_result, oiii_result):
+        """Align the result images following built-in script pattern."""
+        try:
+            self.siril.log("Aligning Ha and OIII result images", LogColor.BLUE)
+            
+            # Create temporary sequence with both results for alignment
+            # Following built-in script: register results -transf=shift -interp=none
+            self.siril.cmd("register", "results", "-transf=shift", "-interp=none")
+            self.siril.log("Applied shift-only registration to align results", LogColor.GREEN)
+            
+            # Return the registered result names
+            return f"r_{ha_result}", f"r_{oiii_result}"
+            
+        except (s.DataError, s.CommandError, s.SirilError) as e:
+            self.siril.log(f"Result alignment failed: {e}", LogColor.RED)
+            return ha_result, oiii_result  # Return originals if alignment fails
+    
+    def normalize_oiii_to_ha(self, ha_result, oiii_result):
+        """Normalize OIII to Ha using PixelMath from built-in script."""
+        try:
+            self.siril.log("Normalizing OIII to Ha using PixelMath", LogColor.BLUE)
+            
+            # Load OIII result for normalization
+            self.siril.cmd("load", oiii_result)
+            
+            # Apply the exact PixelMath formula from built-in script:
+            # pm $r_results_00002$*mad($r_results_00001$)/mad($r_results_00002$)-mad($r_results_00001$)/mad($r_results_00002$)*median($r_results_00002$)+median($r_results_00001$)
+            pixelmath_formula = f"${oiii_result}$*mad(${ha_result}$)/mad(${oiii_result}$)-mad(${ha_result}$)/mad(${oiii_result}$)*median(${oiii_result}$)+median(${ha_result}$)"
+            
+            self.siril.log(f"Applying PixelMath normalization: {pixelmath_formula}", LogColor.BLUE)
+            self.siril.cmd("pm", pixelmath_formula)
+            
+            # Save the normalized OIII result
+            normalized_oiii = f"normalized_{oiii_result}"
+            self.siril.cmd("save", normalized_oiii)
+            
+            self.siril.log("Successfully normalized OIII to Ha reference", LogColor.GREEN)
+            return normalized_oiii
+            
+        except (s.DataError, s.CommandError, s.SirilError) as e:
+            self.siril.log(f"OIII normalization failed: {e}", LogColor.RED)
+            return oiii_result  # Return original if normalization fails
+    
+    def create_final_hoo_composition(self, ha_result, normalized_oiii_result):
+        """Create final HOO composition using normalized channels."""
+        try:
+            self.siril.log("Creating final HOO composition", LogColor.BLUE)
+            
+            # HOO palette: Ha -> Red, OIII -> Green and Blue
+            output_name = "HOO_final_result"
+            self.siril.cmd("rgbcomp", ha_result, normalized_oiii_result, normalized_oiii_result, f"-out={output_name}")
+            
+            self.siril.log(f"Successfully created HOO composition: {output_name}", LogColor.GREEN)
+            return output_name
+            
+        except (s.DataError, s.CommandError, s.SirilError) as e:
+            self.siril.log(f"Final HOO composition failed: {e}", LogColor.RED)
+            return None
+
     def is_black_frame(self, data, threshold=10, crop_fraction=0.4):
         if data.ndim > 2:
             data = data[0]
@@ -490,6 +613,42 @@ class PreprocessingInterface:
         for index in black_indices:
             self.siril.cmd("unselect", seq_name, index, index)
 
+    def create_master_calibration(self, seq_name):
+        """Create master calibration frames following built-in script pattern."""
+        try:
+            # Create masters directory if it doesn't exist
+            masters_dir = "masters"
+            os.makedirs(masters_dir, exist_ok=True)
+            
+            if seq_name == "biases":
+                self.siril.log("Creating master bias frame", LogColor.BLUE)
+                # Stack Bias Frames to bias_stacked.fit
+                self.siril.cmd("stack", "bias rej 3 3", "-nonorm", f"-out=../{masters_dir}/bias_stacked")
+                
+            elif seq_name == "flats":
+                self.siril.log("Creating master flat frame", LogColor.BLUE)
+                # Calibrate flats with bias if available
+                if os.path.exists(os.path.join(self.current_working_directory, f"{masters_dir}/bias_stacked{self.fits_extension}")):
+                    self.siril.cmd("calibrate", "flat", f"-bias=../{masters_dir}/bias_stacked")
+                    # Stack calibrated flats
+                    self.siril.cmd("stack", "pp_flat rej 3 3", "-norm=mul", f"-out=../{masters_dir}/pp_flat_stacked")
+                else:
+                    # Stack flats without bias calibration
+                    self.siril.cmd("stack", "flat rej 3 3", "-norm=mul", f"-out=../{masters_dir}/flat_stacked")
+                    
+            elif seq_name == "darks":
+                self.siril.log("Creating master dark frame", LogColor.BLUE)
+                # Stack Dark Frames to dark_stacked.fit
+                self.siril.cmd("stack", "dark rej 3 3", "-nonorm", f"-out=../{masters_dir}/dark_stacked")
+            
+            self.siril.log(f"Created master {seq_name} frame", LogColor.GREEN)
+            self.siril.cmd("cd", "..")
+            
+        except (s.DataError, s.CommandError, s.SirilError) as e:
+            self.siril.log(f"Master calibration creation failed for {seq_name}: {e}", LogColor.RED)
+            self.siril.cmd("cd", "..")
+            raise e
+    
     def calibration_stack(self, seq_name):
         # not in /process dir here
         if seq_name == "flats":
@@ -534,6 +693,34 @@ class PreprocessingInterface:
         self.siril.log(f"Completed stacking {seq_name}!", LogColor.GREEN)
         self.siril.cmd("cd", "..")
 
+    def calibrate_lights_with_masters(self, seq_name, use_darks=False, use_flats=False):
+        """Calibrate lights using master frames following built-in script pattern."""
+        masters_dir = "masters"
+        
+        cmd_args = ["calibrate", f"{seq_name}"]
+        
+        # Add master calibration frames if they exist
+        if use_darks and os.path.exists(os.path.join(self.current_working_directory, f"{masters_dir}/dark_stacked{self.fits_extension}")):
+            cmd_args.append(f"-dark=../{masters_dir}/dark_stacked")
+            
+        if use_flats:
+            # Check for calibrated flat first, then uncalibrated
+            if os.path.exists(os.path.join(self.current_working_directory, f"{masters_dir}/pp_flat_stacked{self.fits_extension}")):
+                cmd_args.append(f"-flat=../{masters_dir}/pp_flat_stacked")
+            elif os.path.exists(os.path.join(self.current_working_directory, f"{masters_dir}/flat_stacked{self.fits_extension}")):
+                cmd_args.append(f"-flat=../{masters_dir}/flat_stacked")
+        
+        # Add CFA parameters for Ha/OIII extraction
+        cmd_args.extend(["-cc=dark", "-cfa", "-equalize_cfa"])
+        
+        self.siril.log(f"Calibrating lights with master frames: {' '.join(cmd_args)}", LogColor.BLUE)
+        
+        try:
+            self.siril.cmd(*cmd_args)
+        except (s.DataError, s.CommandError, s.SirilError) as e:
+            self.siril.log(f"Light calibration failed: {e}", LogColor.RED)
+            self.close_dialog()
+    
     def calibrate_lights(self, seq_name, use_darks=False, use_flats=False):
         cmd_args = [
             "calibrate",
@@ -772,8 +959,12 @@ class PreprocessingInterface:
             f"3. If on Windows and you have more than {UI_DEFAULTS['max_files_per_batch']} files, this script will automatically split them into batches.\n"
             "4. If batching, intermediary files are cleaned up automatically even if 'clean up files' is unchecked.\n"
             "5. If batching, the frames are automatically feathered during the final stack even if 'feather' is unchecked.\n"
-            "6. Drizzle increases processing time. Higher the drizzle the longer it takes.\n"
-            "7. When asking for help, please have the logs handy."
+            "6. Ha/OIII extraction uses built-in script pattern with -resample=ha for proper upscaling.\n"
+            "7. Ha/OIII workflow creates master calibration frames in masters/ directory.\n"
+            "8. Ha/OIII extraction keeps all frames as CFA (no debayering) to preserve channel data.\n"
+            "9. HOO palette uses PixelMath normalization and result alignment for best quality.\n"
+            "10. Drizzle increases processing time. Higher the drizzle the longer it takes.\n"
+            "11. When asking for help, please have the logs handy."
         )
         self.siril.info_messagebox(help_text, True)
         self.siril.log(help_text, LogColor.BLUE)
@@ -870,17 +1061,39 @@ class PreprocessingInterface:
             variable=bg_extract_checkbox_variable,
         ).grid(row=2, column=1, sticky="w")
 
-        ttk.Label(calib_section, text="Registration:", style="Bold.TLabel").grid(
+        ttk.Label(calib_section, text="Ha/OIII Processing:", style="Bold.TLabel").grid(
             row=3, column=0, sticky="w"
         )
 
+        haoiii_checkbox_variable = tk.BooleanVar()
+        haoiii_checkbox = ttk.Checkbutton(
+            calib_section, text="Extract Ha/OIII", variable=haoiii_checkbox_variable
+        )
+        haoiii_checkbox.grid(row=3, column=1, sticky="w")
+        tksiril.create_tooltip(
+            haoiii_checkbox,
+            "Extract Ha/OIII channels from dual-band filter images.\n"
+            "Creates HOO palette similar to Hubble SHO.\n"
+            "Useful for narrowband imaging with OSC cameras.",
+        )
+
+        ttk.Label(calib_section, text="Registration:", style="Bold.TLabel").grid(
+            row=4, column=0, sticky="w"
+        )
+
         drizzle_checkbox_variable = tk.BooleanVar()
-        ttk.Checkbutton(
+        drizzle_checkbox = ttk.Checkbutton(
             calib_section, text="Drizzle?", variable=drizzle_checkbox_variable
-        ).grid(row=3, column=1, sticky="w")
+        )
+        drizzle_checkbox.grid(row=4, column=1, sticky="w")
+        tksiril.create_tooltip(
+            drizzle_checkbox,
+            "Drizzle upsamples images during registration to recover resolution.\n"
+            "For Ha/OIII extraction: drizzle is automatically enabled with Ha getting 2x additional drizzle for resolution recovery."
+        )
 
         drizzle_amount_label = ttk.Label(calib_section, text="Drizzle amount:")
-        drizzle_amount_label.grid(row=3, column=2, sticky="w")
+        drizzle_amount_label.grid(row=4, column=2, sticky="w")
         drizzle_amount_variable = tk.DoubleVar(value=UI_DEFAULTS["drizzle_amount"])
         drizzle_amount_spinbox = ttk.Spinbox(
             calib_section,
@@ -890,7 +1103,7 @@ class PreprocessingInterface:
             increment=0.1,
             state=tk.DISABLED,
         )
-        drizzle_amount_spinbox.grid(row=3, column=3, sticky="w")
+        drizzle_amount_spinbox.grid(row=4, column=3, sticky="w")
         drizzle_checkbox_variable.trace_add(
             "write",
             lambda *args: drizzle_amount_spinbox.config(
@@ -899,7 +1112,7 @@ class PreprocessingInterface:
             ),
         )
         ttk.Label(calib_section, text="Pixel Fraction:").grid(
-            row=4, column=2, sticky="w"
+            row=5, column=2, sticky="w"
         )
         pixel_fraction_variable = tk.DoubleVar(value=UI_DEFAULTS["pixel_fraction"])
         pixel_fraction_spinbox = ttk.Spinbox(
@@ -910,7 +1123,7 @@ class PreprocessingInterface:
             increment=0.01,
             state=tk.DISABLED,
         )
-        pixel_fraction_spinbox.grid(row=4, column=3, sticky="w")
+        pixel_fraction_spinbox.grid(row=5, column=3, sticky="w")
         drizzle_checkbox_variable.trace_add(
             "write",
             lambda *args: pixel_fraction_spinbox.config(
@@ -920,17 +1133,17 @@ class PreprocessingInterface:
         )
 
         ttk.Label(calib_section, text="Stacking:", style="Bold.TLabel").grid(
-            row=5, column=0, sticky="w"
+            row=6, column=0, sticky="w"
         )
 
         feather_checkbox_variable = tk.BooleanVar()
         feather_checkbox = ttk.Checkbutton(
             calib_section, text="Feather?", variable=feather_checkbox_variable
         )
-        feather_checkbox.grid(row=5, column=1, sticky="w")
+        feather_checkbox.grid(row=6, column=1, sticky="w")
 
         feather_amount_label = ttk.Label(calib_section, text="Feather amount:")
-        feather_amount_label.grid(row=5, column=2, sticky="w")
+        feather_amount_label.grid(row=6, column=2, sticky="w")
         feather_amount_variable = tk.DoubleVar(value=UI_DEFAULTS["feather_amount"])
         feather_amount_spinbox = ttk.Spinbox(
             calib_section,
@@ -940,7 +1153,7 @@ class PreprocessingInterface:
             increment=5,
             state=tk.DISABLED,
         )
-        feather_amount_spinbox.grid(row=5, column=3, sticky="w")
+        feather_amount_spinbox.grid(row=6, column=3, sticky="w")
         feather_checkbox_variable.trace_add(
             "write",
             lambda *args: feather_amount_spinbox.config(
@@ -1022,11 +1235,12 @@ class PreprocessingInterface:
                 use_flats=flats_checkbox_variable.get(),
                 use_biases=biases_checkbox_variable.get(),
                 bg_extract=bg_extract_checkbox_variable.get(),
+                ha_oiii_extract=haoiii_checkbox_variable.get(),
                 drizzle=drizzle_checkbox_variable.get(),
-                drizzle_amount=drizzle_amount_spinbox.get(),
-                pixel_fraction=pixel_fraction_spinbox.get(),
+                drizzle_amount=float(drizzle_amount_spinbox.get()),
+                pixel_fraction=float(pixel_fraction_spinbox.get()),
                 feather=feather_checkbox_variable.get(),
-                feather_amount=feather_amount_spinbox.get(),
+                feather_amount=float(feather_amount_spinbox.get()),
                 clean_up_files=cleanup_files_checkbox_variable.get(),
             ),
         ).pack(pady=(15, 0), side=tk.RIGHT)
@@ -1105,7 +1319,7 @@ class PreprocessingInterface:
         self.drizzle_factor = drizzle_amount
 
         # Output name is actually the name of the batched working directory
-        self.convert_files(dir_name=output_name)
+        self.convert_files(dir_name=output_name, ha_oiii_mode=False)  # Regular batching always uses normal mode
         self.unselect_bad_fits(seq_name=output_name)
 
         seq_name = f"{output_name}_"
@@ -1171,6 +1385,157 @@ class PreprocessingInterface:
 
         return file_name
 
+    def process_ha_oiii_workflow(
+        self,
+        use_darks: bool = False,
+        use_flats: bool = False,
+        use_biases: bool = False,
+        bg_extract: bool = False,
+        drizzle: bool = False,
+        drizzle_amount: float = UI_DEFAULTS["drizzle_amount"],
+        pixel_fraction: float = UI_DEFAULTS["pixel_fraction"],
+        clean_up_files: bool = False,
+    ):
+        """Process images using Ha/OIII extraction workflow following built-in script pattern."""
+        self.siril.log("Starting Ha/OIII extraction workflow (built-in script pattern)", LogColor.GREEN)
+        
+        try:
+            # Phase 1: Create master calibration frames (like built-in script)
+            if use_biases:
+                self.siril.log("Processing bias frames", LogColor.BLUE)
+                self.siril.cmd("cd", "biases")
+                self.siril.cmd("convert", "bias", "-out=../process")
+                self.siril.cmd("cd", "../process")
+                self.create_master_calibration("biases")
+                if clean_up_files:
+                    self.clean_up("bias")
+                    
+            if use_flats:
+                self.siril.log("Processing flat frames", LogColor.BLUE)
+                self.siril.cmd("cd", "flats")
+                self.siril.cmd("convert", "flat", "-out=../process")
+                self.siril.cmd("cd", "../process")
+                self.create_master_calibration("flats")
+                if clean_up_files:
+                    self.clean_up("flat")
+                    self.clean_up("pp_flat")
+                    
+            if use_darks:
+                self.siril.log("Processing dark frames", LogColor.BLUE)
+                self.siril.cmd("cd", "darks")
+                self.siril.cmd("convert", "dark", "-out=../process")
+                self.siril.cmd("cd", "../process")
+                self.create_master_calibration("darks")
+                if clean_up_files:
+                    self.clean_up("dark")
+            
+            # Phase 2: Process light frames
+            self.siril.log("Processing light frames", LogColor.BLUE)
+            self.siril.cmd("cd", "lights")
+            self.siril.cmd("convert", "light", "-out=../process")
+            self.siril.cmd("cd", "../process")
+            
+            seq_name = "light"
+            
+            # Phase 3: Calibrate light frames using masters
+            if use_darks or use_flats:
+                self.calibrate_lights_with_masters(
+                    seq_name=seq_name, 
+                    use_darks=use_darks, 
+                    use_flats=use_flats
+                )
+                seq_name = "pp_light"
+                if clean_up_files:
+                    self.clean_up("light")
+            
+            # Phase 4: Extract Ha and OIII with resampling
+            self.siril.log("Extracting Ha and OIII channels with resampling", LogColor.BLUE)
+            ha_seq, oiii_seq = self.extract_ha_oiii(seq_name=seq_name)
+            
+            if ha_seq is None or oiii_seq is None:
+                self.siril.log("Ha/OIII extraction failed, aborting", LogColor.RED)
+                return None
+                
+            if clean_up_files:
+                self.clean_up(seq_name)
+            
+            # Phase 5: Process Ha channel
+            self.siril.log("Processing Ha channel", LogColor.BLUE)
+            ha_result = self.process_single_channel(ha_seq, "00001")
+            if clean_up_files:
+                self.clean_up(ha_seq)
+                self.clean_up(f"r_{ha_seq}")
+            
+            # Phase 6: Process OIII channel 
+            self.siril.log("Processing OIII channel", LogColor.BLUE)
+            oiii_result = self.process_single_channel(oiii_seq, "00002")
+            if clean_up_files:
+                self.clean_up(oiii_seq)
+                self.clean_up(f"r_{oiii_seq}")
+            
+            if ha_result is None or oiii_result is None:
+                self.siril.log("Channel processing failed", LogColor.RED)
+                return None
+            
+            # Phase 7: Align the result images
+            self.siril.log("Aligning Ha and OIII results", LogColor.BLUE)
+            aligned_ha, aligned_oiii = self.align_results(ha_result, oiii_result)
+            
+            # Phase 8: Normalize OIII to Ha using PixelMath
+            self.siril.log("Normalizing OIII to Ha reference", LogColor.BLUE)
+            normalized_oiii = self.normalize_oiii_to_ha(aligned_ha, aligned_oiii)
+            
+            # Save normalized OIII with LIVETIME info like built-in script
+            try:
+                current_fits_headers = self.siril.get_image_fits_header(return_as="dict")
+                livetime = current_fits_headers.get("LIVETIME", "0")
+                livetime_suffix = f"_{livetime}s" if livetime != "0" else ""
+                oiii_final_name = f"result_OIII{livetime_suffix}"
+                self.siril.cmd("save", f"../{oiii_final_name}")
+                self.siril.log(f"Saved OIII result: {oiii_final_name}", LogColor.GREEN)
+            except Exception as e:
+                self.siril.log(f"Could not save OIII with LIVETIME: {e}", LogColor.SALMON)
+            
+            # Phase 9: Save Ha final result  
+            try:
+                self.siril.cmd("load", aligned_ha)
+                current_fits_headers = self.siril.get_image_fits_header(return_as="dict")
+                livetime = current_fits_headers.get("LIVETIME", "0")
+                livetime_suffix = f"_{livetime}s" if livetime != "0" else ""
+                ha_final_name = f"result_Ha{livetime_suffix}"
+                self.siril.cmd("save", f"../{ha_final_name}")
+                self.siril.log(f"Saved Ha result: {ha_final_name}", LogColor.GREEN)
+            except Exception as e:
+                self.siril.log(f"Could not save Ha with LIVETIME: {e}", LogColor.SALMON)
+            
+            # Phase 10: Create final HOO composition
+            hoo_result = self.create_final_hoo_composition(aligned_ha, normalized_oiii)
+            
+            if hoo_result is None:
+                self.siril.log("HOO composition failed", LogColor.RED)
+                return None
+            
+            # Load and save the final HOO result
+            self.siril.cmd("load", hoo_result)
+            
+            # Go back to working directory
+            self.siril.cmd("cd", "../")
+            
+            # Save the final result
+            final_file_name = self.save_image("_HOO")
+            self.siril.log(f"Ha/OIII workflow completed successfully: {final_file_name}", LogColor.GREEN)
+            
+            return final_file_name
+            
+        except Exception as e:
+            self.siril.log(f"Ha/OIII workflow failed: {e}", LogColor.RED)
+            # Make sure we're back in the working directory
+            try:
+                self.siril.cmd("cd", "../")
+            except:
+                pass
+            return None
+
     def unselect_bad_fits(self, seq_name, folder="process"):
         """
         Checks all FITS files in the given folder with the given prefix
@@ -1229,6 +1594,7 @@ class PreprocessingInterface:
         use_flats: bool = False,
         use_biases: bool = False,
         bg_extract: bool = False,
+        ha_oiii_extract: bool = False,
         drizzle: bool = False,
         drizzle_amount: float = UI_DEFAULTS["drizzle_amount"],
         pixel_fraction: float = UI_DEFAULTS["pixel_fraction"],
@@ -1246,6 +1612,7 @@ class PreprocessingInterface:
             f"use_flats={use_flats}\n"
             f"use_biases={use_biases}\n"
             f"bg_extract={bg_extract}\n"
+            f"ha_oiii_extract={ha_oiii_extract}\n"
             f"drizzle={drizzle}\n"
             f"drizzle_amount={drizzle_amount}\n"
             f"pixel_fraction={pixel_fraction}\n"
@@ -1259,22 +1626,26 @@ class PreprocessingInterface:
         self.drizzle_status = drizzle
         self.drizzle_factor = drizzle_amount
 
-        # TODO: Stack calibration frames and copy to the various batch dirs
-        if use_biases:
-            self.convert_files("biases")
-            self.calibration_stack("biases")
-            if clean_up_files:
-                self.clean_up("biases")
-        if use_flats:
-            self.convert_files("flats")
-            self.calibration_stack("flats")
-            if clean_up_files:
-                self.clean_up("flats")
-        if use_darks:
-            self.convert_files("darks")
-            self.calibration_stack("darks")
-            if clean_up_files:
-                self.clean_up("darks")
+        # For Ha/OIII workflow, calibration is handled internally
+        # For regular workflow, create calibration masters in process directory
+        if not ha_oiii_extract:
+            if use_biases:
+                self.convert_files("biases", ha_oiii_mode=ha_oiii_extract)
+                self.calibration_stack("biases")
+                if clean_up_files:
+                    self.clean_up("biases")
+            if use_flats:
+                self.convert_files("flats", ha_oiii_mode=ha_oiii_extract)
+                self.calibration_stack("flats")
+                if clean_up_files:
+                    self.clean_up("flats")
+            if use_darks:
+                self.convert_files("darks", ha_oiii_mode=ha_oiii_extract)
+                self.calibration_stack("darks")
+                if clean_up_files:
+                    self.clean_up("darks")
+        else:
+            self.siril.log("Ha/OIII workflow selected - calibration handled by built-in script pattern", LogColor.BLUE)
 
         # Check files in working directory/lights.
         # create sub folders with more than 2048 divided by equal amounts
@@ -1290,8 +1661,25 @@ class PreprocessingInterface:
         num_files = len(all_files)
         is_windows = sys.platform.startswith("win")
 
+        # Check if Ha/OIII extraction is enabled
+        if ha_oiii_extract:
+            self.siril.log("Ha/OIII extraction enabled - using narrowband workflow", LogColor.BLUE)
+            file_name = self.process_ha_oiii_workflow(
+                use_darks=use_darks,
+                use_flats=use_flats,
+                use_biases=use_biases,
+                bg_extract=bg_extract,
+                drizzle=drizzle,
+                drizzle_amount=drizzle_amount,
+                pixel_fraction=pixel_fraction,
+                clean_up_files=clean_up_files,
+            )
+            if file_name is None:
+                self.siril.log("Ha/OIII workflow failed", LogColor.RED)
+                return
+            self.load_image(image_name=file_name)
         # only one batch will be run if less than max_files_per_batch OR not windows.
-        if num_files <= UI_DEFAULTS["max_files_per_batch"] or not is_windows:
+        elif num_files <= UI_DEFAULTS["max_files_per_batch"] or not is_windows:
             self.siril.log(
                 f"{num_files} files found in the lights directory which is less than or equal to {UI_DEFAULTS['max_files_per_batch']} files allowed per batch - no batching needed.",
                 LogColor.BLUE,
@@ -1382,7 +1770,7 @@ class PreprocessingInterface:
                 batch_dir = f"{batch_lights}{i+1}"
                 shutil.rmtree(batch_dir, ignore_errors=True)
 
-            self.convert_files(final_stack_seq_name)
+            self.convert_files(final_stack_seq_name, ha_oiii_mode=False)  # Batching final stack uses normal mode
             self.seq_plate_solve(seq_name=final_stack_seq_name)
             # turn off drizzle for this
             self.drizzle_status = False
@@ -1416,21 +1804,25 @@ class PreprocessingInterface:
 
         # Spcc as a last step
         if do_spcc:
-            img = self.spcc(
-                oscsensor=telescope,
-                filter=filter,
-                catalog=catalog,
-                whiteref="Average Spiral Galaxy",
-            )
-
-            # self.autostretch(do_spcc=do_spcc)
-            if drizzle:
-                img = os.path.basename(img) + self.fits_extension
+            # For Ha/OIII workflow, SPCC may not be as applicable since it's already a processed composite
+            if ha_oiii_extract:
+                self.siril.log("SPCC is typically not applied to HOO composite images", LogColor.SALMON)
             else:
-                img = os.path.basename(img)
-            self.load_image(
-                image_name=os.path.basename(img)
-            )  # Load either og or spcc image
+                img = self.spcc(
+                    oscsensor=telescope,
+                    filter=filter,
+                    catalog=catalog,
+                    whiteref="Average Spiral Galaxy",
+                )
+
+                # self.autostretch(do_spcc=do_spcc)
+                if drizzle:
+                    img = os.path.basename(img) + self.fits_extension
+                else:
+                    img = os.path.basename(img)
+                self.load_image(
+                    image_name=os.path.basename(img)
+                )  # Load either og or spcc image
 
         # self.clean_up()
         import datetime
